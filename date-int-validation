@@ -1,0 +1,200 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+# Added by Krishnan
+from datetime import datetime
+from awsglue.dynamicframe import DynamicFrame
+
+# Prerequisites - setup source and target tables in glue catalog through crawler
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+# Script generated for node S3 bucket - Read from S3 - change database, table names as needed
+S3bucket_node1 = glueContext.create_dynamic_frame.from_catalog(
+    database="finch-files",
+    table_name="finch_source_files",
+    transformation_ctx="S3bucket_node1",
+)
+
+print ('Krishnan')
+
+def append_error(str, err_str):
+    if (str == ""):
+        return err_str
+    else:
+        return str + "; " + err_str
+        
+# Custom function to validate data one record at a time
+# Define allowed low and high vals for date1
+date1_allowed_lowval = datetime(1850, 1, 1)
+date1_allowed_highval = datetime.now()
+
+def validate_date1(date1):
+# Validate date1
+#  - cannot be null,
+#  - should be valid date, error out 2020/02/30 for example, some java/javascript date functions treat 2020/02/30 as 2020/03/01
+#  - allow for yyyy/mm/dd or yyyy-mm -dd as date format, convert to - if / is used
+#  - date > 1850-01-01, 
+#  - cannot be future date
+    error_string = ""
+    if ('date1' == ""):
+        error_string = append_error(error_string, 'date1 is invalid - cannot be null')
+    else:
+        try:
+            dt = datetime.strptime(date1, '%Y-%m-%d')
+        except:
+            try:
+                dt = datetime.strptime(date1, '%Y/%m/%d')
+            except:
+                error_string = append_error(error_string, 'date1 [' + date1 + '] is invalid - check data or format - supported formats are yyyy/mm/dd and yyyy-mm-dd')
+            else:
+                if (dt < date1_allowed_lowval):
+                    error_string = append_error(error_string, 'date1 is invalid - less than allowed lower cut off of 1850/01/01')
+                elif (dt > date1_allowed_highval):
+                    error_string = append_error(error_string, 'date1 is invalid - cannot be a future date')
+                else:
+                    date1 = date1.replace('/', '-')
+        else:
+            if (dt < date1_allowed_lowval):
+                error_string = append_error(error_string, 'date1 is invalid - less than allowed lower cut off of 1850/01/01')
+            elif (dt > date1_allowed_highval):
+                error_string = append_error(error_string, 'date1 is invalid - cannot be a future date')
+    return (date1, error_string)
+
+def validate_date2(date2, date1, error_string):
+# Validate date2
+#  - allow for yyyy/mm/dd or yyyy-mm -dd as date format, convert to - if / is used
+#  - cannot be < date1
+    if (date2 != ""):
+        dt1 = datetime.strptime(date1, '%Y-%m-%d')
+        try:
+            dt2 = datetime.strptime(date2, '%Y-%m-%d')
+        except:
+            try:
+                dt2 = datetime.strptime(date2, '%Y/%m/%d')
+            except:
+                error_string = append_error(error_string, 'date2 [' + date2 + '] is invalid - check data or delimiter - supported formats are yyyy/mm/dd and yyyy-mm-dd')
+            else:
+                if (dt2 < dt1):
+                    error_string = append_error(error_string, 'date2 [' + date2 + '] is invalid - cannot be less than date1 [' + date1 + ']')
+                else:
+                    date2 = date2.replace('/', '-')
+    return (date2, error_string)
+
+def validate_code(code, error_string):
+# Validate code
+#  - should be valid integer < 2000
+    print ('printing code in function')
+    print (code)
+    if (code == None):
+        error_string = append_error(error_string, 'code cannot be null')
+    else:
+        if (type(code) is int):
+            code = str(code)
+        try:
+            if (int(code) > 2000):
+                error_string = append_error(error_string, 'code [' + code + '] is invalid - value cannot be greater than 2000')
+        except:
+            error_string = append_error(error_string, 'code [' + code + '] is invalid - not a number')
+    
+    return error_string    
+
+def validateRecord(rec):
+    try:
+        error_message = ""
+        rec["date1"], error_message = validate_date1(rec['date1'])
+        rec["date2"], error_message = validate_date2(rec['date2'], rec['date1'], error_message)
+        tmp_code = rec['code']
+        error_message = validate_code(tmp_code, error_message)
+        rec['error_details'] = error_message
+        if (error_message == ""):
+            rec['error_ind'] = 100 # No error
+        else:
+            rec['error_ind'] = 200 # Error
+    except Exception as e:
+        rec['error_ind'] = 200
+        rec['error_details'] = 'Unhandled error'
+        print ("*********** error " + str(rec['id']) + " " + str(e))
+        #print (type(rec['code']))
+        print (e)
+    return rec
+
+
+print ('Source')
+S3bucket_node1.toDF().printSchema()
+S3bucket_node1.toDF().show(10)
+
+ApplyMapping_node2 = S3bucket_node1.resolveChoice(specs = [('code','cast:string')])
+
+print ('Resolve choice')
+ApplyMapping_node2.toDF().printSchema()
+ApplyMapping_node2.toDF().show(10)
+
+validated_dyF =  Map.apply(frame = ApplyMapping_node2, f = validateRecord)
+print ('validated dyf')
+validated_dyF.toDF().printSchema()
+validated_dyF.toDF().show(10)
+
+#records = SplitRows.apply(frame = validated_dyF, comparison_dict = {"error_ind": {"<": "150", ">": "150"}}, name1 = 'good', name2 = 'error')
+
+# Get good records from validated dataframe; 
+good_records_df = validated_dyF.toDF().where("error_ind = 100")
+good_records = DynamicFrame.fromDF(good_records_df, glueContext, "good_records")
+
+print ('good records')
+good_records.printSchema()
+good_records.toDF().show(10)
+
+error_records_df = validated_dyF.toDF().where("error_ind = 200")
+error_records = DynamicFrame.fromDF(error_records_df, glueContext, "error_records")
+print ('error records')
+error_records.printSchema()
+error_records.toDF().show(10)
+
+# Script generated for node ApplyMapping
+ApplyMapping_node3 = ApplyMapping.apply(
+    frame=good_records,
+    mappings=[
+        ("id", "long", "c1", "long"),
+        ("date1", "string", "c2", "date"),
+        ("date2", "string", "c3", "date"),
+        ("code", "string", "c4", "long"),
+    ],
+    transformation_ctx="ApplyMapping_node3",
+)
+
+node3 = glueContext.write_dynamic_frame.from_catalog(
+    frame=ApplyMapping_node3,
+    database="finch-db",
+    table_name="finch_public_t1",
+    transformation_ctx="node3",
+)
+
+ApplyMapping_node4 = ApplyMapping.apply(
+    frame=error_records,
+    mappings=[
+        ("id", "long", "c1", "string"),
+        ("date1", "string", "c2", "string"),
+        ("date2", "string", "c3", "string"),
+        ("code", "string", "c4", "string"),
+        ("error_details", "c5", "string"),
+    ],
+    transformation_ctx="ApplyMapping_node4",
+)
+
+node4 = glueContext.write_dynamic_frame.from_catalog(
+    frame=ApplyMapping_node4,
+    database="finch-db",
+    table_name="finch_public_t1_errors",
+    transformation_ctx="node4",
+)
+
+job.commit()
